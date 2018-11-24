@@ -24,6 +24,33 @@ def sinc(band,t_right):
 
     return y
     
+class Conv1d_samepadding(nn.Module):
+    def __init__(self,in_channel, out_channel, kernel_size=3,strides = 1,dilation =  1, bias=True, padding=0):
+        super(Conv1d_samepadding, self).__init__()
+        self.strides = strides
+        self.conv1 = nn.Conv1d(in_channel,out_channel,kernel_size, stride=strides,dilation=dilation, bias=bias)
+        self.kernel_size = kernel_size
+
+    def get_same_pad_1d(self, in_width, casual = False):
+        out_width  = math.ceil(float(in_width) / float(self.strides))
+        pad_along_width = max((out_width - 1) * self.strides +
+                           self.kernel_size - in_width, 0)
+        if casual:
+            pad_left = 0
+            pad_right = int(pad_along_width)
+        else:
+            pad_left = int(pad_along_width // 2)
+            pad_right = int(pad_along_width - pad_left)
+        return pad_left, pad_right
+    
+    def forward(self, x):
+        original_size = x.size()
+#        print("conv",original_size)
+        paddings = self.get_same_pad_1d(original_size[-1], casual = False)
+#        print("paddings",paddings)
+        x = F.pad(x,paddings)
+        x_conv = self.conv1(x)
+        return x_conv
     
 class sinc_conv(nn.Module):
 
@@ -85,6 +112,68 @@ class sinc_conv(nn.Module):
         return out
     
 
+    
+class sinc_conv_with_conv(nn.Module):
+
+    def __init__(self, N_filt,Filt_dim,fs):
+        super(sinc_conv,self).__init__()
+
+        # Mel Initialization of the filterbanks
+        low_freq_mel = 80
+        high_freq_mel = (2595 * np.log10(1 + (fs / 2) / 700))  # Convert Hz to Mel
+        mel_points = np.linspace(low_freq_mel, high_freq_mel, N_filt)  # Equally spaced in Mel scale
+        f_cos = (700 * (10**(mel_points / 2595) - 1)) # Convert Mel to Hz
+        b1=np.roll(f_cos,1)
+        b2=np.roll(f_cos,-1)
+        b1[0]=30
+        b2[-1]=(fs/2)-100
+                
+        self.freq_scale=fs*1.0
+        self.filt_b1 = nn.Parameter(torch.from_numpy(b1/self.freq_scale))
+        self.filt_band = nn.Parameter(torch.from_numpy((b2-b1)/self.freq_scale))
+
+        
+        self.N_filt=N_filt
+        self.Filt_dim=Filt_dim
+        self.fs=fs
+        self.conv1d_samepadding = Conv1d_samepadding(80,80,9)
+        
+
+    def forward(self, x):
+        
+        filters=Variable(torch.zeros((self.N_filt,self.Filt_dim))).cuda()
+        N=self.Filt_dim
+        t_right=Variable(torch.linspace(1, (N-1)/2, steps=int((N-1)/2))/self.fs).cuda()
+        
+        
+        min_freq=50.0;
+        min_band=50.0;
+        
+        filt_beg_freq=torch.abs(self.filt_b1)+min_freq/self.freq_scale
+        filt_end_freq=filt_beg_freq+(torch.abs(self.filt_band)+min_band/self.freq_scale)
+       
+        n=torch.linspace(0, N, steps=N)
+
+        # Filter window (hamming)
+        window=0.54-0.46*torch.cos(2*math.pi*n/N);
+        window=Variable(window.float().cuda())
+
+        
+        for i in range(self.N_filt):
+                        
+            low_pass1 = 2*filt_beg_freq[i].float()*sinc(filt_beg_freq[i].float()*self.freq_scale,t_right)
+            low_pass2 = 2*filt_end_freq[i].float()*sinc(filt_end_freq[i].float()*self.freq_scale,t_right)
+            band_pass=(low_pass2-low_pass1)
+
+            band_pass=band_pass/torch.max(band_pass)
+
+            filters[i,:]=band_pass.cuda()*window
+
+        out=F.conv1d(x, filters.view(self.N_filt,1,self.Filt_dim))
+        out = self.conv1d_samepadding(out)
+    
+        return out
+    
 def act_fun(act_type):
 
  if act_type=="relu":
